@@ -19,19 +19,13 @@ import (
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
-	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
+	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
 
-	// "github.com/libp2p/go-libp2p/p2p/muxer/mplex"
-	// "github.com/libp2p/go-libp2p/p2p/protocol/circuitv1/relay"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
-	"github.com/libp2p/go-libp2p/p2p/muxer/mplex"
-	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv1/relay"
-	"github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
-	"github.com/libp2p/go-libp2p/p2p/protocol/identify"
 	wrtc "github.com/libp2p/go-libp2p/p2p/transport/webrtc"
 	"github.com/pkg/profile"
 
@@ -39,7 +33,23 @@ import (
 	ma "github.com/multiformats/go-multiaddr"
 )
 
-var incs uint32 = 0
+// a global counter for the number of incoming streams
+// processed
+var incomingStreams uint32 = 0
+
+const (
+	connectionOpenInterval = 1 * time.Second
+	streamOpenInterval     = 100 * time.Millisecond
+	writeInterval          = 500 * time.Millisecond
+)
+
+func main() {
+	tracer.Start(tracer.WithRuntimeMetrics())
+	defer tracer.Stop()
+	test()
+
+	select {}
+}
 
 func test() {
 
@@ -88,22 +98,10 @@ func test() {
 		var wg sync.WaitGroup
 		for i := 0; i < *connF; i++ {
 			go runSender(ctx, *targetF, *tcpF, *streamF, &wg)
-			time.Sleep(1 * time.Second)
+			time.Sleep(connectionOpenInterval)
 		}
 		wg.Wait()
 	}
-}
-
-func main() {
-	// makeRelayV1()
-	//
-	// tracer.Start(tracer.WithRuntimeMetrics())
-	// defer tracer.Stop()
-	// test()
-	//
-	connectToRelay()
-
-	select {}
 }
 
 // makeBasicHost creates a LibP2P host with a random peer ID listening on the
@@ -133,7 +131,7 @@ func makeBasicHost(listenPort int, tpt string, insecure bool, randseed int64, op
 		libp2p.DefaultTransports,
 		libp2p.Transport(wrtc.New),
 		libp2p.Identity(priv),
-		// libp2p.DisableRelay(),
+		libp2p.DisableRelay(),
 		libp2p.ResourceManager(mgr),
 	}
 
@@ -276,17 +274,17 @@ func runSender(ctx context.Context, targetPeer string, tpt string, streamCount i
 					log.Printf("[%d] error reading from remote: %v\n", idx, err)
 					return
 				}
-				time.Sleep(500 * time.Millisecond)
+				time.Sleep(writeInterval)
 			}
 		}()
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(streamOpenInterval)
 
 	}
 }
 
 // doEcho reads a line of data a stream and writes it back
 func doEcho(s network.Stream) error {
-	sn := atomic.AddUint32(&incs, 1)
+	sn := atomic.AddUint32(&incomingStreams, 1)
 	log.Printf("processing incoming stream number: %d\n", sn)
 	buf := bufio.NewReader(s)
 	for {
@@ -305,120 +303,4 @@ func doEcho(s network.Stream) error {
 			return err
 		}
 	}
-}
-
-func makeRelayV1() {
-	r := rand.Reader
-	// Generate a key pair for this host. We will use it at least
-	// to obtain a valid host ID.
-	priv, _, err := crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, r)
-	if err != nil {
-		panic(err)
-	}
-
-	opts := []libp2p.Option{
-		libp2p.DefaultTransports,
-		libp2p.Transport(wrtc.New),
-		libp2p.ListenAddrStrings(
-			"/ip4/0.0.0.0/tcp/4003/ws",
-			fmt.Sprintf("/ip4/0.0.0.0/udp/%d/webrtc", 4004)),
-		libp2p.Identity(priv),
-		libp2p.Muxer("/mplex/6.7.0", mplex.DefaultTransport),
-		libp2p.EnableRelay(),
-	}
-
-	host, err := libp2p.New(opts...)
-	if err != nil {
-		panic(err)
-	}
-
-	_, err = relay.NewRelay(host)
-	if err != nil {
-		panic(err)
-	}
-
-	fmt.Println(host.Mux().Protocols())
-
-	for _, addr := range host.Addrs() {
-		a, err := ma.NewMultiaddr(fmt.Sprintf("/p2p/%s", host.ID().Pretty()))
-		if err != nil {
-			panic(err)
-		}
-		fmt.Println(addr.Encapsulate(a))
-	}
-}
-
-func connectToRelay() {
-	peerF := flag.String("t", "", "target peer to dial")
-	flag.Parse()
-	host, err := makeBasicHost(0, "", false, 0)
-	if err != nil {
-		log.Fatal(err)
-	}
-	maddr, err := ma.NewMultiaddr(*peerF)
-	if err != nil {
-		log.Fatal("bad multiaddr: ", err)
-		return
-	}
-
-	// Extract the peer ID from the multiaddr.
-	info, err := peer.AddrInfoFromP2pAddr(maddr)
-	if err != nil {
-		log.Fatal(err)
-		return
-	}
-
-	err = host.Connect(context.Background(), *info)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	sub, err := host.EventBus().Subscribe(
-		[]interface{}{
-			&event.EvtPeerIdentificationCompleted{},
-			&event.EvtLocalAddressesUpdated{},
-		},
-	)
-
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	go func() {
-		defer sub.Close()
-		for e := range sub.Out() {
-			switch e.(type) {
-			case event.EvtPeerIdentificationCompleted:
-				// evt := e.(event.EvtPeerIdentificationCompleted)
-				// protocols, err := host.Peerstore().GetProtocols(evt.Peer)
-				// if err != nil {
-				// 	log.Fatal("could not get protocols for peer: ", evt.Peer)
-				// }
-				// log.Printf("peerID: %v , protocols: %v\n", evt.Peer, protocols)
-			case event.EvtLocalAddressesUpdated:
-				evt := e.(event.EvtLocalAddressesUpdated)
-				log.Printf("addresses: %v\n", evt.Current)
-			default:
-				log.Fatal("bad event type")
-			}
-
-		}
-	}()
-
-	idService, err := identify.NewIDService(host)
-	conns := host.Network().ConnsToPeer(info.ID)
-	if len(conns) == 0 {
-		log.Fatalf("no connection to peer: %v", info.ID)
-	}
-
-	<-idService.IdentifyWait(conns[0])
-
-	// attempt to connect relay v2
-	reservation, err := client.Reserve(context.Background(), host, *info)
-	if err != nil {
-		log.Fatal("could not reserve")
-	}
-
-	log.Printf("reservation: %v", reservation)
-
 }
